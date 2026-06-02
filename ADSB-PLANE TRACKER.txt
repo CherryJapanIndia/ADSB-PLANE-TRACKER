@@ -1,0 +1,539 @@
+import pygame
+import math
+import requests
+import time
+import wave
+import struct
+import io
+import threading
+
+# CONFIG
+WIDTH, HEIGHT = 800, 600
+FPS = 60
+RADAR_SPEED = 0.02
+FETCH_INTERVAL = 15
+BBOX_DEGREES = 1.0
+PAN_STEP_DEGREES = 0.2
+ZOOM_STEP = 0.8
+MIN_ZOOM = 0.2
+MAX_ZOOM = 4.0
+PANEL_WIDTH = 280
+PANEL_MARGIN = 18
+
+DARK_GREEN = (5, 16, 5)
+TRAIL_GREEN = (5, 16, 5, 20)
+NEON_GREEN = (51, 255, 51)
+BRIGHT_GREEN = (150, 255, 150)
+WHITE = (235, 255, 235)
+PANEL_BG = (12, 28, 14, 220)
+PANEL_BORDER = (70, 180, 70)
+TEXT_SHADOW = (0, 0, 0)
+
+
+class RadarApp:
+    def __init__(self):
+        pygame.init()
+        try:
+            pygame.mixer.init()
+        except pygame.error:
+            pass
+
+        pygame.display.set_caption("TERMINAL \\ RADAR.SYS")
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("courier", 14, bold=True)
+
+        self.cx = WIDTH // 2
+        self.cy = HEIGHT // 2
+        self.radius = min(WIDTH, HEIGHT) // 2 - 40
+
+        self.radar_angle = 0.0
+        self.planes = []
+        self.status_msg = "INITIALIZING SYSTEM..."
+        self.my_lat, self.my_lon = None, None
+        self.view_lat, self.view_lon = None, None
+        self.zoom = 1.0
+        self.dragging = False
+        self.dragged = False
+        self.drag_start = None
+        self.view_start = None
+        self.selected_icao24 = None
+        self.selected_info_lines = ["SELECT A PLANE FOR INFO."]
+        self.last_update = "NEVER"
+        self.connected = False
+        self.coord_lock = threading.Lock()
+        self.ping_sound = None
+
+        self.heading_font = pygame.font.SysFont("courier", 18, bold=True)
+        self.small_font = pygame.font.SysFont("courier", 12)
+
+        self.fade_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        self.fade_surface.fill(TRAIL_GREEN)
+
+        self.setup_audio()
+        self.get_location()
+
+        self.running = True
+        self.api_thread = threading.Thread(target=self.fetch_loop, daemon=True)
+        self.api_thread.start()
+
+    def setup_audio(self):
+        """Generate a sonar ping sound into memory."""
+        self.status_msg = "SYNTHESIZING AUDIO..."
+        sample_rate = 44100
+        duration = 1.5
+        freq = 750.0
+
+        buf = io.BytesIO()
+        with wave.open(buf, "w") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+
+            for i in range(int(sample_rate * duration)):
+                t = float(i) / sample_rate
+                env = (t / 0.05) if t < 0.05 else math.exp(-3 * (t - 0.05))
+                val = math.sin(2 * math.pi * freq * t) * env
+                amplitude = int(32767 * 0.5 * val)
+                wav.writeframes(struct.pack("<h", amplitude))
+
+        buf.seek(0)
+        try:
+            self.ping_sound = pygame.mixer.Sound(buf)
+        except pygame.error:
+            self.ping_sound = None
+            self.status_msg = "AUDIO INITIALIZATION FAILED."
+
+    def get_location(self):
+        """Finds rough coordinates based on IP address."""
+        self.status_msg = "TRIANGULATING IP LOCATION..."
+        try:
+            resp = requests.get("http://ip-api.com/json/", timeout=5).json()
+            self.my_lat = resp.get("lat")
+            self.my_lon = resp.get("lon")
+            if self.my_lat is None or self.my_lon is None:
+                raise ValueError("Invalid location data")
+            self.status_msg = f"COORDS LOCKED: {self.my_lat}, {self.my_lon}"
+        except Exception:
+            self.my_lat, self.my_lon = 40.64, -73.77
+            self.status_msg = "LOCATION FAILED. DEFAULT: JFK AIRPORT."
+
+        self.view_lat = self.my_lat
+        self.view_lon = self.my_lon
+
+    def fetch_loop(self):
+        """Background thread to fetch ADS-B data without freezing the radar sweep."""
+        headers = {"User-Agent": "PythonRetroRadar/1.0"}
+        while self.running:
+            with self.coord_lock:
+                center_lat = self.view_lat
+                center_lon = self.view_lon
+                zoom = self.zoom
+
+            if center_lat is not None and center_lon is not None:
+                half_range = BBOX_DEGREES * zoom
+                lamin = center_lat - half_range
+                lomin = center_lon - half_range
+                lamax = center_lat + half_range
+                lomax = center_lon + half_range
+                url = (
+                    "https://opensky-network.org/api/states/all"
+                    f"?lamin={lamin}&lomin={lomin}&lamax={lamax}&lomax={lomax}"
+                )
+                try:
+                    data = requests.get(url, headers=headers, timeout=10).json()
+                    new_planes = []
+
+                    states = data.get("states") if data else []
+                    if states:
+                        for state in states:
+                            icao24 = state[0]
+                            callsign = state[1].strip() if state[1] else "N/A"
+                            origin = state[2] or "N/A"
+                            lon, lat = state[5], state[6]
+                            baro_altitude = state[7]
+                            on_ground = state[8]
+                            velocity = state[9]
+                            true_track = state[10]
+                            vertical_rate = state[11]
+                            geo_altitude = state[13]
+                            squawk = state[14]
+                            if lon is None or lat is None:
+                                continue
+
+                            x_offset = ((lon - center_lon) / half_range) * self.radius
+                            y_offset = ((lat - center_lat) / half_range) * self.radius * -1
+                            angle = math.atan2(y_offset, x_offset)
+                            if angle < 0:
+                                angle += 2 * math.pi
+
+                            distance = math.hypot(y_offset, x_offset)
+                            new_planes.append(
+                                {
+                                    "icao24": icao24,
+                                    "callsign": callsign,
+                                    "origin": origin,
+                                    "lat": lat,
+                                    "lon": lon,
+                                    "baro_altitude": baro_altitude,
+                                    "geo_altitude": geo_altitude,
+                                    "on_ground": on_ground,
+                                    "velocity": velocity,
+                                    "true_track": true_track,
+                                    "vertical_rate": vertical_rate,
+                                    "squawk": squawk,
+                                    "x_offset": x_offset,
+                                    "y_offset": y_offset,
+                                    "angle": angle,
+                                    "distance": distance,
+                                    "pinged": False,
+                                    "brightness": 0,
+                                }
+                            )
+                        self.status_msg = f"LINK ESTABLISHED. TARGETS: {len(new_planes)}"
+                    else:
+                        self.status_msg = "NO TARGETS IN VIEW."
+
+                    self.planes = new_planes
+                    self.connected = True
+                    self.last_update = time.strftime("%H:%M:%S")
+                except Exception as e:
+                    self.connected = False
+                    self.status_msg = f"DATA FETCH ERROR: {e}"
+            time.sleep(FETCH_INTERVAL)
+
+    def draw_grid(self):
+        # subtle radar glow with a clean backdrop
+        glow_surface = pygame.Surface((self.radius * 2, self.radius * 2), pygame.SRCALPHA)
+        for i in range(3):
+            alpha = 16 - i * 5
+            pygame.draw.circle(
+                glow_surface,
+                (30, 90, 30, alpha),
+                (self.radius, self.radius),
+                int(self.radius * (1 - i * 0.2)),
+            )
+        self.screen.blit(glow_surface, (self.cx - self.radius, self.cy - self.radius))
+
+        for ring in range(1, 4):
+            pygame.draw.circle(
+                self.screen,
+                (15, 45, 15),
+                (self.cx, self.cy),
+                int(self.radius * ring / 4),
+                1,
+            )
+
+        pygame.draw.line(
+            self.screen,
+            (15, 45, 15),
+            (self.cx - self.radius, self.cy),
+            (self.cx + self.radius, self.cy),
+            1,
+        )
+        pygame.draw.line(
+            self.screen,
+            (15, 45, 15),
+            (self.cx, self.cy - self.radius),
+            (self.cx, self.cy + self.radius),
+            1,
+        )
+
+        title = self.heading_font.render("TERMINAL RADAR", True, NEON_GREEN)
+        self.screen.blit(title, (20, 18))
+
+        subtitle = self.small_font.render("Click a target for live info", True, WHITE)
+        self.screen.blit(subtitle, (20, 48))
+
+    def draw_panel(self):
+        panel_rect = pygame.Rect(
+            WIDTH - PANEL_WIDTH - PANEL_MARGIN,
+            PANEL_MARGIN,
+            PANEL_WIDTH,
+            HEIGHT - PANEL_MARGIN * 2,
+        )
+        panel_surface = pygame.Surface((panel_rect.width, panel_rect.height), pygame.SRCALPHA)
+        panel_surface.fill(PANEL_BG)
+        pygame.draw.rect(panel_surface, PANEL_BORDER, panel_surface.get_rect(), 2)
+
+        header = self.heading_font.render("RADAR DASHBOARD", True, NEON_GREEN)
+        panel_surface.blit(header, (16, 16))
+
+        status = "ONLINE" if self.connected else "OFFLINE"
+        status_color = NEON_GREEN if self.connected else (255, 120, 120)
+        lines = [
+            f"STATUS: {status}",
+            f"UPDATED: {self.last_update}",
+            f"TRACKING: {len(self.planes)}",
+            f"ZOOM: {self.zoom:.1f}x",
+        ]
+
+        y = 56
+        for idx, line in enumerate(lines):
+            color = status_color if idx == 0 else WHITE
+            label = self.small_font.render(line, True, color)
+            panel_surface.blit(label, (16, y))
+            y += 20
+
+        y += 10
+        pygame.draw.line(panel_surface, PANEL_BORDER, (16, y), (panel_rect.width - 16, y), 1)
+        y += 16
+
+        selected_header = self.font.render("SELECTED", True, NEON_GREEN)
+        panel_surface.blit(selected_header, (16, y))
+        y += 26
+
+        for plane_line in self.selected_info_lines[:5]:
+            info_label = self.small_font.render(plane_line, True, WHITE)
+            panel_surface.blit(info_label, (16, y))
+            y += 18
+
+        y += 14
+        pygame.draw.line(panel_surface, PANEL_BORDER, (16, y), (panel_rect.width - 16, y), 1)
+        y += 16
+
+        target_header = self.font.render("NEAREST", True, NEON_GREEN)
+        panel_surface.blit(target_header, (16, y))
+        y += 26
+
+        nearest = sorted(self.planes, key=lambda p: p["distance"])[:4]
+        if nearest:
+            for plane in nearest:
+                display_name = plane["callsign"] if plane["callsign"] != "N/A" else plane["icao24"]
+                distance_text = f"{int(plane['distance']):3d}m"
+                target_text = f"{display_name[:12]:12} {distance_text}"
+                label = self.small_font.render(target_text, True, WHITE)
+                panel_surface.blit(label, (16, y))
+                y += 18
+        else:
+            label = self.small_font.render("No nearby targets", True, WHITE)
+            panel_surface.blit(label, (16, y))
+            y += 18
+
+        y = panel_rect.height - 46
+        instruction = self.small_font.render("CLICK target to select, DRAG to pan", True, WHITE)
+        panel_surface.blit(instruction, (16, y))
+
+        self.screen.blit(panel_surface, (panel_rect.x, panel_rect.y))
+
+    def draw(self):
+        self.screen.blit(self.fade_surface, (0, 0))
+        self.draw_grid()
+        self.draw_panel()
+
+        pygame.draw.circle(self.screen, NEON_GREEN, (self.cx, self.cy), self.radius, 2)
+        pygame.draw.line(
+            self.screen,
+            NEON_GREEN,
+            (self.cx - self.radius, self.cy),
+            (self.cx + self.radius, self.cy),
+            1,
+        )
+        pygame.draw.line(
+            self.screen,
+            NEON_GREEN,
+            (self.cx, self.cy - self.radius),
+            (self.cx, self.cy + self.radius),
+            1,
+        )
+
+        sweep_x = self.cx + math.cos(self.radar_angle) * self.radius
+        sweep_y = self.cy + math.sin(self.radar_angle) * self.radius
+        pygame.draw.line(self.screen, NEON_GREEN, (self.cx, self.cy), (sweep_x, sweep_y), 2)
+
+        for plane in self.planes:
+            if plane["distance"] > self.radius:
+                continue
+
+            x = int(self.cx + plane["x_offset"])
+            y = int(self.cy + plane["y_offset"])
+            if plane["brightness"] > 10:
+                bright = plane["brightness"] / 255
+                color = (
+                    int(BRIGHT_GREEN[0] * bright),
+                    int(BRIGHT_GREEN[1] * bright),
+                    int(BRIGHT_GREEN[2] * bright),
+                )
+            else:
+                color = NEON_GREEN
+
+            if plane["icao24"] == self.selected_icao24:
+                pygame.draw.circle(self.screen, WHITE, (x, y), 10, 2)
+
+            pygame.draw.circle(self.screen, color, (x, y), 5)
+            callsign_text = self.font.render(plane["callsign"], True, color)
+            bg_rect = callsign_text.get_rect(topleft=(x + 10, y - 8)).inflate(8, 4)
+            pygame.draw.rect(self.screen, (0, 0, 0, 180), bg_rect)
+            self.screen.blit(callsign_text, (x + 12, y - 6))
+
+            if not plane["pinged"] and 0 < (self.radar_angle - plane["angle"] + 2 * math.pi) % (2 * math.pi) < 0.1:
+                if self.ping_sound:
+                    vol = max(0.1, 1.0 - (plane["distance"] / self.radius))
+                    self.ping_sound.set_volume(vol)
+                    self.ping_sound.play()
+                plane["pinged"] = True
+                plane["brightness"] = 255
+            elif (self.radar_angle - plane["angle"] + 2 * math.pi) % (2 * math.pi) > 0.25:
+                plane["pinged"] = False
+
+            plane["brightness"] = max(0, plane["brightness"] - 2)
+
+        self.radar_angle += RADAR_SPEED
+        if self.radar_angle >= math.pi * 2:
+            self.radar_angle -= math.pi * 2
+
+    def map_pixel_to_geo(self, px, py):
+        half_range = BBOX_DEGREES * self.zoom
+        lon = self.view_lon + ((px - self.cx) / self.radius) * half_range
+        lat = self.view_lat - ((py - self.cy) / self.radius) * half_range
+        return lat, lon
+
+    def format_plane_info(self, plane):
+        if not plane:
+            return ["SELECT A PLANE FOR INFO."]
+
+        altitude = f"{plane['baro_altitude']:.0f} m" if plane['baro_altitude'] is not None else "N/A"
+        velocity = f"{plane['velocity']:.0f} m/s" if plane['velocity'] is not None else "N/A"
+        track = f"{plane['true_track']:.0f}°" if plane['true_track'] is not None else "N/A"
+        vertical = f"{plane['vertical_rate']:.0f} m/s" if plane['vertical_rate'] is not None else "N/A"
+        squawk = plane['squawk'] or "N/A"
+        return [
+            f"CALLSIGN: {plane['callsign']}",
+            f"ICAO: {plane['icao24']}  ORIGIN: {plane['origin']}",
+            f"ALT: {altitude}  SPD: {velocity}",
+            f"TRK: {track}  V/S: {vertical}",
+            f"SQK: {squawk}",
+        ]
+
+    def fetch_plane_info(self, icao24):
+        headers = {"User-Agent": "PythonRetroRadar/1.0"}
+        url = f"https://opensky-network.org/api/states/all?icao24={icao24}"
+        try:
+            data = requests.get(url, headers=headers, timeout=10).json()
+            states = data.get("states") if data else []
+            if states:
+                state = states[0]
+                plane = {
+                    "icao24": state[0],
+                    "callsign": state[1].strip() if state[1] else "N/A",
+                    "origin": state[2] or "N/A",
+                    "baro_altitude": state[7],
+                    "velocity": state[9],
+                    "true_track": state[10],
+                    "vertical_rate": state[11],
+                    "squawk": state[14],
+                }
+                with self.coord_lock:
+                    self.selected_info_lines = self.format_plane_info(plane)
+            else:
+                with self.coord_lock:
+                    self.selected_info_lines = ["INTERNET INFO EMPTY FOR SELECTED PLANE."]
+        except Exception as e:
+            with self.coord_lock:
+                self.selected_info_lines = [f"INFO FETCH ERROR: {e}"]
+
+    def change_view(self, dlat, dlon):
+        with self.coord_lock:
+            self.view_lat += dlat
+            self.view_lon += dlon
+
+    def reset_view(self):
+        with self.coord_lock:
+            self.view_lat = self.my_lat
+            self.view_lon = self.my_lon
+            self.zoom = 1.0
+
+    def handle_event(self, event):
+        if event.type == pygame.QUIT:
+            self.running = False
+
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.running = False
+            elif event.key == pygame.K_r:
+                self.reset_view()
+            elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
+                with self.coord_lock:
+                    self.zoom = max(MIN_ZOOM, self.zoom * ZOOM_STEP)
+            elif event.key == pygame.K_MINUS:
+                with self.coord_lock:
+                    self.zoom = min(MAX_ZOOM, self.zoom / ZOOM_STEP)
+            elif event.key == pygame.K_LEFT:
+                self.change_view(0, -PAN_STEP_DEGREES * self.zoom)
+            elif event.key == pygame.K_RIGHT:
+                self.change_view(0, PAN_STEP_DEGREES * self.zoom)
+            elif event.key == pygame.K_UP:
+                self.change_view(PAN_STEP_DEGREES * self.zoom, 0)
+            elif event.key == pygame.K_DOWN:
+                self.change_view(-PAN_STEP_DEGREES * self.zoom, 0)
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self.dragging = True
+                self.dragged = False
+                self.drag_start = event.pos
+                self.view_start = (self.view_lat, self.view_lon)
+            elif event.button == 4:
+                with self.coord_lock:
+                    self.zoom = max(MIN_ZOOM, self.zoom / ZOOM_STEP)
+            elif event.button == 5:
+                with self.coord_lock:
+                    self.zoom = min(MAX_ZOOM, self.zoom * ZOOM_STEP)
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                if not self.dragged:
+                    click_x, click_y = event.pos
+                    selected = None
+                    for plane in self.planes:
+                        x = int(self.cx + plane["x_offset"])
+                        y = int(self.cy + plane["y_offset"])
+                        if math.hypot(click_x - x, click_y - y) <= 10:
+                            selected = plane
+                            break
+
+                    if selected:
+                        self.selected_icao24 = selected["icao24"]
+                        with self.coord_lock:
+                            self.selected_info_lines = ["FETCHING INTERNET INFO..."]
+                        threading.Thread(
+                            target=self.fetch_plane_info,
+                            args=(selected["icao24"],),
+                            daemon=True,
+                        ).start()
+                    else:
+                        new_lat, new_lon = self.map_pixel_to_geo(click_x, click_y)
+                        with self.coord_lock:
+                            self.view_lat = new_lat
+                            self.view_lon = new_lon
+                self.dragging = False
+
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            dx = event.pos[0] - self.drag_start[0]
+            dy = event.pos[1] - self.drag_start[1]
+            if abs(dx) > 4 or abs(dy) > 4:
+                self.dragged = True
+            half_range = BBOX_DEGREES * self.zoom
+            dlon = -(dx / self.radius) * half_range
+            dlat = (dy / self.radius) * half_range
+            with self.coord_lock:
+                self.view_lat = self.view_start[0] + dlat
+                self.view_lon = self.view_start[1] + dlon
+
+    def run(self):
+        while self.running:
+            for event in pygame.event.get():
+                self.handle_event(event)
+
+            self.screen.fill(DARK_GREEN)
+            self.fade_surface.fill(TRAIL_GREEN)
+            self.draw()
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    app = RadarApp()
+    app.run()
