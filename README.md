@@ -8,4 +8,5 @@ You can click a plane to get more details, drag to pan, and zoom with mouse whee
 Click a plane to fetch detailed info
 Drag the radar to pan the view
 Mouse wheel or + / - to zoom
-Arrow keys pan, r resets to current location. >_<
+Arrow keys pan, R resets to current location. >_<
+Side Note: you need pygame and requests to run it.....
